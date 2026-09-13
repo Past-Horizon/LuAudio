@@ -1,0 +1,128 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
+
+#include <spa/utils/cleanup.h>
+#include <spa/utils/json-builder.h>
+#include <pipewire/pipewire.h>
+
+#include "../module.h"
+#include "../pulse-server.h"
+#include "../server.h"
+
+/** \page page_pulse_module_native_protocol_tcp Pulseaudio TCP Protocol
+ *
+ * ## Module Name
+ *
+ * `module-native-protocol-tcp`
+ *
+ * ## Module Options
+ *
+ * @pulse_module_options@
+ */
+
+
+static const struct module_args valid_args[] = {
+	{ "port", "TCP port number", 0, MODULE_TYPE_INT, "4713" },
+	{ "listen", "address to listen on", 0, MODULE_TYPE_STRING, NULL },
+	{ "auth-anonymous", "don't check for cookies", 0, MODULE_TYPE_BOOL, NULL },
+	{ NULL, }
+};
+
+#define NAME "protocol-tcp"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+struct module_native_protocol_tcp_data {
+	struct module *module;
+	struct pw_array servers;
+};
+
+static int module_native_protocol_tcp_load(struct module *module)
+{
+	struct module_native_protocol_tcp_data *data = module->user_data;
+	struct impl *impl = module->impl;
+	const char *address;
+	int res;
+
+	if ((address = pw_properties_get(module->props, "pulse.tcp")) == NULL)
+		return -EIO;
+
+	pw_array_init(&data->servers, sizeof(struct server *));
+
+	res = servers_create_and_start(impl, address, &data->servers);
+	if (res < 0)
+		return res;
+
+	return 0;
+}
+
+static int module_native_protocol_tcp_unload(struct module *module)
+{
+	struct module_native_protocol_tcp_data *d = module->user_data;
+	struct server **s;
+
+	pw_array_for_each (s, &d->servers)
+		server_free(*s);
+
+	pw_array_clear(&d->servers);
+
+	return 0;
+}
+
+static const struct spa_dict_item module_native_protocol_tcp_info[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Native protocol (TCP sockets)" },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+static int module_native_protocol_tcp_prepare(struct module * const module)
+{
+	struct module_native_protocol_tcp_data * const d = module->user_data;
+	struct pw_properties * const props = module->props;
+	const char *port, *listen, *auth;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res;
+
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	if ((port = pw_properties_get(props, "port")) == NULL)
+		port = SPA_STRINGIFY(PW_PROTOCOL_PULSE_DEFAULT_PORT);
+
+	listen = pw_properties_get(props, "listen");
+
+	auth = pw_properties_get(props, "auth-anonymous");
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+		return res;
+
+	spa_json_builder_array_push(&b, "[");
+	spa_json_builder_array_push(&b,   "{");
+	spa_json_builder_object_stringf(&b,  "address", "tcp:%s%s%s",
+			listen ? listen : "", listen ? ":" : "", port);
+	if (auth && module_args_parse_bool(auth))
+		spa_json_builder_object_string(&b, "client.access", "unrestricted");
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_pop(&b,        "]");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
+
+	pw_properties_set(props, "pulse.tcp", args);
+
+	d->module = module;
+
+	return 0;
+}
+
+DEFINE_MODULE_INFO(module_native_protocol_tcp) = {
+	.name = "module-native-protocol-tcp",
+	.valid_args = valid_args,
+	.prepare = module_native_protocol_tcp_prepare,
+	.load = module_native_protocol_tcp_load,
+	.unload = module_native_protocol_tcp_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_native_protocol_tcp_info),
+	.data_size = sizeof(struct module_native_protocol_tcp_data),
+};

@@ -1,0 +1,142 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
+
+#include <spa/utils/cleanup.h>
+#include <spa/utils/hook.h>
+#include <spa/utils/json-builder.h>
+#include <pipewire/pipewire.h>
+
+#include "../defs.h"
+#include "../module.h"
+
+/** \page page_pulse_module_zeroconf_discover Zeroconf Discover
+ *
+ * ## Module Name
+ *
+ * `module-zeroconf-discover`
+ *
+ * ## Module Options
+ *
+ * @pulse_module_options@
+ *
+ * ## See Also
+ *
+ * \ref page_module_zeroconf_discover "libpipewire-module-zeroconf-discover"
+ */
+
+
+static const struct module_args valid_args[] = {
+	{ "latency_msec", "fixed latency", 0, MODULE_TYPE_MSEC, NULL },
+	{ "reconnect_interval_ms", "interval to try reconnects, 0 or omitted if disabled", 0, MODULE_TYPE_MSEC, NULL },
+	{ NULL, }
+};
+
+#define NAME "zeroconf-discover"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+
+struct module_zeroconf_discover_data {
+	struct module *module;
+
+	struct spa_hook mod_listener;
+	struct pw_impl_module *mod;
+
+	uint32_t latency_msec;
+	uint32_t reconnect_interval_ms;
+};
+
+static void module_destroy(void *data)
+{
+	struct module_zeroconf_discover_data *d = data;
+	spa_hook_remove(&d->mod_listener);
+	d->mod = NULL;
+	module_schedule_unload(d->module);
+}
+
+static const struct pw_impl_module_events module_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = module_destroy
+};
+
+static int module_zeroconf_discover_load(struct module *module)
+{
+	struct module_zeroconf_discover_data *data = module->user_data;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res;
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+		return res;
+
+	spa_json_builder_array_push(&b, "{");
+	if (data->latency_msec > 0)
+		spa_json_builder_object_uint(&b, "pulse.latency", data->latency_msec);
+	if (data->reconnect_interval_ms > 0)
+		spa_json_builder_object_uint(&b, "reconnect.interval.ms",
+				data->reconnect_interval_ms);
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
+
+	data->mod = pw_context_load_module(module->impl->context,
+			"libpipewire-module-zeroconf-discover",
+			args, NULL);
+
+	if (data->mod == NULL)
+		return -errno;
+
+	pw_impl_module_add_listener(data->mod,
+			&data->mod_listener,
+			&module_events, data);
+
+	return 0;
+}
+
+static int module_zeroconf_discover_unload(struct module *module)
+{
+	struct module_zeroconf_discover_data *d = module->user_data;
+
+	if (d->mod) {
+		spa_hook_remove(&d->mod_listener);
+		pw_impl_module_destroy(d->mod);
+		d->mod = NULL;
+	}
+
+	return 0;
+}
+
+static const struct spa_dict_item module_zeroconf_discover_info[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.con>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "mDNS/DNS-SD Service Discovery" },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+static int module_zeroconf_discover_prepare(struct module * const module)
+{
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	struct pw_properties * const props = module->props;
+	struct module_zeroconf_discover_data * const data = module->user_data;
+	data->module = module;
+
+	pw_properties_fetch_uint32(props, "latency_msec", &data->latency_msec);
+	pw_properties_fetch_uint32(props, "reconnect_interval_ms",
+			&data->reconnect_interval_ms);
+
+	return 0;
+}
+
+DEFINE_MODULE_INFO(module_zeroconf_discover) = {
+	.name = "module-zeroconf-discover",
+	.valid_args = valid_args,
+	.load_once = true,
+	.prepare = module_zeroconf_discover_prepare,
+	.load = module_zeroconf_discover_load,
+	.unload = module_zeroconf_discover_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_zeroconf_discover_info),
+	.data_size = sizeof(struct module_zeroconf_discover_data),
+};

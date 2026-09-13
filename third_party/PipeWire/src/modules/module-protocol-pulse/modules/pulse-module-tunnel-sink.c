@@ -1,0 +1,216 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
+
+#include <spa/param/audio/format-utils.h>
+#include <spa/utils/cleanup.h>
+#include <spa/utils/hook.h>
+#include <spa/utils/json-builder.h>
+
+#include <pipewire/pipewire.h>
+#include <pipewire/i18n.h>
+
+#include "../defs.h"
+#include "../module.h"
+
+/** \page page_pulse_module_tunnel_sink Tunnel Sink
+ *
+ * ## Module Name
+ *
+ * `module-tunnel-sink`
+ *
+ * ## Module Options
+ *
+ * @pulse_module_options@
+ *
+ * ## See Also
+ *
+ * \ref page_module_pulse_tunnel "libpipewire-module-pulse-tunnel"
+ */
+
+
+static const struct module_args valid_args[] = {
+	{ "server", "address", MODULE_ARG_MANDATORY, MODULE_TYPE_STRING, NULL },
+	{ "sink", "name of the remote sink", 0, MODULE_TYPE_STRING, NULL },
+	{ "sink_name", "name for the local sink", 0, MODULE_TYPE_STRING, NULL },
+	{ "sink_properties", "properties for the local sink", 0, MODULE_TYPE_PROPS, NULL },
+	{ "reconnect_interval_ms", "interval to try reconnects, 0 or omitted if disabled", 0, MODULE_TYPE_MSEC, NULL },
+	{ "format", "sample format", 0, MODULE_TYPE_FORMAT, NULL },
+	{ "channels", "number of channels", 0, MODULE_TYPE_INT, NULL },
+	{ "rate", "sample rate", 0, MODULE_TYPE_INT, NULL },
+	{ "channel_map", "channel map", 0, MODULE_TYPE_CHMAP, NULL },
+	{ "latency_msec", "fixed latency", 0, MODULE_TYPE_MSEC, NULL },
+	{ "cookie", "cookie file path", 0, MODULE_TYPE_STRING, NULL },
+	{ NULL, }
+};
+
+#define NAME "tunnel-sink"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+struct module_tunnel_sink_data {
+	struct module *module;
+
+	struct pw_impl_module *mod;
+	struct spa_hook mod_listener;
+
+	struct pw_properties *stream_props;
+};
+
+static void module_destroy(void *data)
+{
+	struct module_tunnel_sink_data *d = data;
+	spa_hook_remove(&d->mod_listener);
+	d->mod = NULL;
+	module_schedule_unload(d->module);
+}
+
+static const struct pw_impl_module_events module_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = module_destroy
+};
+
+static int module_tunnel_sink_load(struct module *module)
+{
+	struct module_tunnel_sink_data *data = module->user_data;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res;
+
+	pw_properties_setf(data->stream_props, "pulse.module.id",
+			"%u", module->index);
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+		return res;
+
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &module->props->dict, 0);
+	spa_json_builder_object_push(&b,  "stream.props", "{");
+	pw_properties_serialize_dict(b.f, &data->stream_props->dict, 0);
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
+
+	data->mod = pw_context_load_module(module->impl->context,
+			"libpipewire-module-pulse-tunnel",
+			args, NULL);
+
+	if (data->mod == NULL)
+		return -errno;
+
+	pw_impl_module_add_listener(data->mod,
+			&data->mod_listener,
+			&module_events, data);
+
+	return 0;
+}
+
+static int module_tunnel_sink_unload(struct module *module)
+{
+	struct module_tunnel_sink_data *d = module->user_data;
+
+	if (d->mod) {
+		spa_hook_remove(&d->mod_listener);
+		pw_impl_module_destroy(d->mod);
+		d->mod = NULL;
+	}
+
+	pw_properties_free(d->stream_props);
+
+	return 0;
+}
+
+static const struct spa_dict_item module_tunnel_sink_info[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Create a network sink which connects to a remote PulseAudio server" },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+static int module_tunnel_sink_prepare(struct module * const module)
+{
+	struct module_tunnel_sink_data * const d = module->user_data;
+	struct pw_properties * const props = module->props;
+	struct pw_properties *stream_props = NULL;
+	const char *str, *server, *remote_sink_name;
+	struct spa_audio_info_raw info = { 0 };
+	int res;
+
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	stream_props = pw_properties_new(NULL, NULL);
+	if (stream_props == NULL) {
+		res = -ENOMEM;
+		goto out;
+	}
+
+	pw_properties_set(props, "tunnel.mode", "sink");
+
+	remote_sink_name = pw_properties_get(props, "sink");
+	if (remote_sink_name)
+		pw_properties_set(props, PW_KEY_TARGET_OBJECT, remote_sink_name);
+
+	if ((server = pw_properties_get(props, "server")) == NULL) {
+		pw_log_error("no server given");
+		res = -EINVAL;
+		goto out;
+	} else {
+		pw_properties_set(props, "pulse.server.address", server);
+	}
+
+	pw_properties_setf(stream_props, PW_KEY_NODE_DESCRIPTION,
+                     _("Tunnel to %s%s%s"), server,
+		     remote_sink_name ? "/" : "",
+		     remote_sink_name ? remote_sink_name : "");
+
+	pw_properties_set(stream_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
+
+	if ((str = pw_properties_get(props, "sink_name")) != NULL) {
+		pw_properties_set(stream_props, PW_KEY_NODE_NAME, str);
+		pw_properties_set(props, "sink_name", NULL);
+	} else {
+		pw_properties_setf(stream_props, PW_KEY_NODE_NAME,
+				"tunnel-sink.%s", server);
+	}
+	pw_properties_set(props, "server", NULL);
+
+	if ((str = pw_properties_get(props, "sink_properties")) != NULL) {
+		module_args_add_props(stream_props, str);
+		pw_properties_set(props, "sink_properties", NULL);
+	}
+	if (module_args_to_audioinfo_keys(module->impl, props,
+			"format", "rate", "channels", "channel_map", &info) < 0) {
+		res = -EINVAL;
+		goto out;
+	}
+	audioinfo_to_properties(&info, stream_props);
+
+	if ((str = pw_properties_get(props, "reconnect_interval_ms")) != NULL) {
+		pw_properties_set(props, "reconnect.interval.ms", str);
+		pw_properties_set(props, "reconnect_interval_ms", NULL);
+	}
+	if ((str = pw_properties_get(props, "latency_msec")) != NULL) {
+		pw_properties_set(props, "pulse.latency", str);
+		pw_properties_set(props, "latency_msec", NULL);
+	}
+
+	d->module = module;
+	d->stream_props = stream_props;
+
+	return 0;
+out:
+	pw_properties_free(stream_props);
+	return res;
+}
+
+DEFINE_MODULE_INFO(module_tunnel_sink) = {
+	.name = "module-tunnel-sink",
+	.valid_args = valid_args,
+	.prepare = module_tunnel_sink_prepare,
+	.load = module_tunnel_sink_load,
+	.unload = module_tunnel_sink_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_tunnel_sink_info),
+	.data_size = sizeof(struct module_tunnel_sink_data),
+};

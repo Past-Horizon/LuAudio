@@ -1,0 +1,830 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2024 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#include "config.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+
+#include <spa/utils/cleanup.h>
+#include <spa/utils/result.h>
+#include <spa/utils/string.h>
+#include <spa/utils/json-builder.h>
+#include <spa/param/audio/format.h>
+#include <spa/param/audio/raw-json.h>
+#include <spa/debug/types.h>
+
+#include <pipewire/impl.h>
+#include <pipewire/i18n.h>
+
+#include "module-protocol-pulse/format.h"
+#include "zeroconf-utils/zeroconf.h"
+
+#include "network-utils.h"
+
+/** \page page_module_snapcast_discover Snapcast Discover
+ *
+ * Automatically creates a Snapcast sink device based on zeroconf
+ * information.
+ *
+ * This module will load module-protocol-simple for each announced stream that matches
+ * the rule with the create-stream action and passes the properties to the module.
+ *
+ * If no stream.rules are given, it will create a sink for all announced
+ * snapcast servers.
+ *
+ * A new stream will be created on the snapcast server with the given
+ * `snapcast.stream-name` or `PipeWire-<hostname>`. You will need to route this new
+ * stream to clients with the snapcast control application.
+ *
+ * ## Module Name
+ *
+ * `libpipewire-module-snapcast-discover`
+ *
+ * ## Module Options
+ *
+ * Options specific to the behavior of this module
+ *
+ * - `snapcast.discover-local` = allow discovery of local services as well.
+ *    false by default.
+ * - `stream.rules` = \<rules\>: match rules, use create-stream actions. See
+ *   \ref page_module_protocol_simple for module properties.
+ *
+ * ### stream.rules matches
+ *
+ *  - `snapcast.ip`: the IP address of the snapcast server
+ *  - `snapcast.port`: the port of the snapcast server
+ *  - `snapcast.ifindex`: the interface index where the snapcast announcement
+ *                        was received.
+ *  - `snapcast.ifname`: the interface name where the snapcast announcement
+ *                        was received.
+ *  - `snapcast.name`: the name of the snapcast server
+ *  - `snapcast.hostname`: the hostname of the snapcast server
+ *  - `snapcast.domain`: the domain of the snapcast server
+ *
+ * ### stream.rules create-stream
+ *
+ * In addition to all the properties that can be passed to
+ * \ref page_module_protocol_simple, you can also set:
+ *
+ * - `snapcast.stream-name`: The name of the stream on a snapcast server.
+ * - `node.name`: The name of the sink that is created on the sender.
+ *
+ * ## Example configuration
+ *
+ *\code{.unparsed}
+ * # ~/.config/pipewire/pipewire.conf.d/my-snapcast-discover.conf
+ *
+ * context.modules = [
+ * {   name = libpipewire-module-snapcast-discover
+ *     args = {
+ *         stream.rules = [
+ *             {   matches = [
+ *                     {    snapcast.ip = "~.*"
+ *                          #snapcast.port = 1000
+ *                          #snapcast.ifindex = 1
+ *                          #snapcast.ifname = eth0
+ *                          #snapcast.name = ""
+ *                          #snapcast.hostname = ""
+ *                          #snapcast.domain = ""
+ *                     }
+ *                 ]
+ *                 actions = {
+ *                     create-stream = {
+ *                         #audio.rate = 44100
+ *                         #audio.format = S16LE   # S16LE, S24_32LE, S32LE
+ *                         #audio.channels = 2
+ *                         #audio.position = [ FL FR ]
+ *                         #
+ *                         # The stream name as is appears on the snapcast
+ *                         # server:
+ *                         #snapcast.stream-name = "PipeWire"
+ *                         #
+ *                         # The name of the sink on the sender:
+ *                         #node.name = "Snapcast Sink"
+ *                         #
+ *                         #capture = true
+ *                         #server.address = [ "tcp:4711" ]
+ *                         #capture.props = {
+ *                             #target.object = ""
+ *                             #node.latency = 2048/48000
+ *                             #media.class = "Audio/Sink"
+ *                         #}
+ *                     }
+ *                 }
+ *             }
+ *         ]
+ *     }
+ * }
+ * ]
+ *\endcode
+ *
+ * ## See also
+ *
+ * \ref page_module_protocol_simple
+ */
+
+#define NAME "snapcast-discover"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+#define MODULE_USAGE "( stream.rules=<rules>, use create-stream actions )"
+
+#define DEFAULT_FORMAT "S16LE"
+#define DEFAULT_RATE 48000
+#define DEFAULT_CHANNELS 2
+#define DEFAULT_POSITION "[ FL FR ]"
+
+#define DEFAULT_CREATE_RULES	\
+        "[ { matches = [ { snapcast.ip = \"~.*\" } ] actions = { create-stream = { } } } ] "
+
+static const struct spa_dict_item module_props[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Discover remote Snapcast streams" },
+	{ PW_KEY_MODULE_USAGE, MODULE_USAGE },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+#define SERVICE_TYPE_JSONRPC "_snapcast-jsonrpc._tcp"
+#define SERVICE_TYPE_CONTROL "_snapcast-ctrl._tcp"
+
+struct impl {
+	struct pw_context *context;
+
+	struct pw_impl_module *module;
+	struct spa_hook module_listener;
+
+	struct pw_properties *properties;
+	bool discover_local;
+	struct pw_loop *loop;
+
+	struct pw_zeroconf *zeroconf;
+	struct spa_hook zeroconf_listener;
+
+	struct spa_list tunnel_list;
+	uint32_t id;
+};
+
+struct tunnel_info {
+	const char *name;
+	const char *host;
+	uint16_t port;
+};
+
+#define TUNNEL_INFO(...) ((struct tunnel_info){ __VA_ARGS__ })
+
+struct tunnel {
+	struct impl *impl;
+	struct spa_list link;
+	struct tunnel_info info;
+	struct pw_impl_module *module;
+	struct spa_hook module_listener;
+	char *server_address;
+	char *stream_name;
+	struct spa_audio_info_raw audio_info;
+	struct spa_source *source;
+	bool connecting;
+	bool need_flush;
+};
+
+static struct tunnel *make_tunnel(struct impl *impl, const struct tunnel_info *info)
+{
+	struct tunnel *t;
+
+	t = calloc(1, sizeof(*t));
+	if (t == NULL)
+		return NULL;
+
+	t->info.name = info->name ? strdup(info->name) : NULL;
+	t->info.host = info->host ? strdup(info->host) : NULL;
+	t->info.port = info->port;
+	t->impl = impl;
+	spa_list_append(&impl->tunnel_list, &t->link);
+
+	return t;
+}
+
+static struct tunnel *find_tunnel(struct impl *impl, const struct tunnel_info *info)
+{
+	struct tunnel *t;
+	spa_list_for_each(t, &impl->tunnel_list, link) {
+		if (spa_streq(t->info.name, info->name))
+			return t;
+	}
+	return NULL;
+}
+
+static void free_tunnel(struct tunnel *t)
+{
+	spa_list_remove(&t->link);
+	if (t->module)
+		pw_impl_module_destroy(t->module);
+	free((char *) t->info.name);
+	free((char *) t->info.host);
+	free(t->server_address);
+	free(t->stream_name);
+	free(t);
+}
+
+static void impl_free(struct impl *impl)
+{
+	struct tunnel *t;
+
+	spa_list_consume(t, &impl->tunnel_list, link)
+		free_tunnel(t);
+
+	if (impl->zeroconf)
+		pw_zeroconf_destroy(impl->zeroconf);
+	pw_properties_free(impl->properties);
+	free(impl);
+}
+
+static void module_destroy(void *data)
+{
+	struct impl *impl = data;
+	spa_hook_remove(&impl->module_listener);
+	impl_free(impl);
+}
+
+static const struct pw_impl_module_events module_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = module_destroy,
+};
+
+static void pw_properties_from_zeroconf(const char *key, const char *value,
+		struct pw_properties *props)
+{
+}
+
+static void submodule_destroy(void *data)
+{
+	struct tunnel *t = data;
+	spa_hook_remove(&t->module_listener);
+	t->module = NULL;
+}
+
+static const struct pw_impl_module_events submodule_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = submodule_destroy,
+};
+
+static int snapcast_disconnect(struct tunnel *t)
+{
+	if (t->source)
+		pw_loop_destroy_source(t->impl->loop, t->source);
+	t->source = NULL;
+	return 0;
+}
+
+static int get_bps(uint32_t format)
+{
+	switch (format) {
+	case SPA_AUDIO_FORMAT_S16_LE:
+		return 16;
+	case SPA_AUDIO_FORMAT_S24_32_LE:
+		return 24;
+	case SPA_AUDIO_FORMAT_S32_LE:
+		return 32;
+	default:
+		return 0;
+	}
+}
+
+static int handle_connect(struct tunnel *t, int fd)
+{
+	int res;
+	socklen_t len;
+	char *str;
+	struct impl *impl = t->impl;
+
+	len = sizeof(res);
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &res, &len) < 0) {
+		pw_log_error("getsockopt: %m");
+		return -errno;
+	}
+	if (res != 0)
+		return -res;
+
+	t->connecting = false;
+	pw_log_info("connected");
+
+	str = spa_aprintf("{\"id\":%u,\"jsonrpc\": \"2.0\",\"method\":\"Server.GetRPCVersion\"}\r\n",
+			impl->id++);
+	if (str == NULL)
+		return -errno;
+	res = write(t->source->fd, str, strlen(str));
+	pw_log_info("wrote %s: %d", str, res);
+	free(str);
+
+	str = spa_aprintf("{\"id\":%u,\"jsonrpc\":\"2.0\",\"method\":\"Stream.RemoveStream\","
+			"\"params\":{\"id\":\"%s\"}}\r\n", impl->id++, t->stream_name);
+	if (str == NULL)
+		return -errno;
+	res = write(t->source->fd, str, strlen(str));
+	pw_log_info("wrote %s: %d", str, res);
+	free(str);
+
+	str = spa_aprintf("{\"id\":%u,\"jsonrpc\":\"2.0\",\"method\":\"Stream.AddStream\""
+		",\"params\":{\"streamUri\":\"tcp://%s?name=%s&mode=client&"
+		"sampleformat=%d:%d:%d&codec=pcm&chunk_ms=20\"}}\r\n", impl->id++,
+		t->server_address, t->stream_name, t->audio_info.rate,
+		get_bps(t->audio_info.format), t->audio_info.channels);
+	if (str == NULL)
+		return -errno;
+	res = write(t->source->fd, str, strlen(str));
+	pw_log_info("wrote %s: %d", str, res);
+	free(str);
+
+	return 0;
+}
+
+static int process_input(struct tunnel *t)
+{
+	char buffer[1024] = "";
+	int res = 0;
+
+	while (true) {
+		res = read(t->source->fd, buffer, sizeof(buffer) - 1);
+		if (res == 0)
+			return -EPIPE;
+		if (res < 0) {
+			res = -errno;
+			if (res == -EINTR)
+				continue;
+			if (res != -EAGAIN && res != -EWOULDBLOCK)
+				return res;
+			break;
+		}
+		buffer[res] = '\0';
+	}
+
+	pw_log_info("received: %s", buffer);
+	return 0;
+}
+
+static int flush_output(struct tunnel *t)
+{
+	t->need_flush = false;
+	return 0;
+}
+
+static void
+on_source_io(void *data, int fd, uint32_t mask)
+{
+	struct tunnel *t = data;
+	int res;
+
+	if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
+		socklen_t len = sizeof(res);
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &res, &len) < 0)
+			res = errno;
+		res = -res;
+		goto error;
+	}
+	if (mask & SPA_IO_IN) {
+		if ((res = process_input(t)) < 0)
+			goto error;
+	}
+	if (mask & SPA_IO_OUT || t->need_flush) {
+		if (t->connecting) {
+			if ((res = handle_connect(t, fd)) < 0)
+				goto error;
+		}
+		res = flush_output(t);
+		if (res >= 0) {
+			pw_loop_update_io(t->impl->loop, t->source,
+				t->source->mask & ~SPA_IO_OUT);
+		} else if (res != -EAGAIN)
+			goto error;
+	}
+done:
+	return;
+error:
+	pw_log_error("%p: got connection error %d (%s)", t, res, spa_strerror(res));
+	snapcast_disconnect(t);
+	goto done;
+}
+
+
+static int snapcast_connect(struct tunnel *t)
+{
+	struct addrinfo hints;
+	struct addrinfo *result, *rp;
+	int res, fd = -1;
+	char port_str[12];
+
+	if (t->server_address == NULL)
+		return 0;
+
+	if (t->source != NULL)
+		snapcast_disconnect(t);
+
+	pw_log_info("%p: connect %s:%u", t, t->info.host, t->info.port);
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = 0;
+	hints.ai_protocol = 0;
+
+	spa_scnprintf(port_str, sizeof(port_str), "%u", t->info.port);
+
+	if ((res = getaddrinfo(t->info.host, port_str, &hints, &result)) != 0) {
+		pw_log_error("getaddrinfo: %s", gai_strerror(res));
+		return -EINVAL;
+	}
+	res = -ENOENT;
+	for (rp = result; rp != NULL; rp = rp->ai_next) {
+		fd = socket(rp->ai_family,
+				rp->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK,
+				rp->ai_protocol);
+		if (fd == -1)
+			continue;
+
+		res = connect(fd, rp->ai_addr, rp->ai_addrlen);
+		if (res == 0 || (res < 0 && errno == EINPROGRESS))
+			break;
+
+		res = -errno;
+		close(fd);
+	}
+	freeaddrinfo(result);
+
+	if (rp == NULL) {
+		pw_log_error("Could not connect to %s:%u: %s", t->info.host, t->info.port,
+				spa_strerror(res));
+		return -EINVAL;
+	}
+
+	t->source = pw_loop_add_io(t->impl->loop, fd,
+			SPA_IO_IN | SPA_IO_OUT | SPA_IO_HUP | SPA_IO_ERR,
+			true, on_source_io, t);
+
+	if (t->source == NULL) {
+		res = -errno;
+		pw_log_error("%p: source create failed: %m", t);
+		close(fd);
+		return res;
+	}
+	t->connecting = true;
+	pw_log_info("%p: connecting", t);
+
+	return 0;
+
+}
+
+static int add_snapcast_stream(struct impl *impl, struct tunnel *t,
+		struct pw_properties *props, const char *servers)
+{
+	struct spa_json it[1];
+	char v[256];
+
+        if (spa_json_begin_array_relax(&it[0], servers, strlen(servers)) <= 0)
+		return -EINVAL;
+
+	while (spa_json_get_string(&it[0], v, sizeof(v)) > 0) {
+		t->server_address = strdup(v);
+		if (t->server_address == NULL)
+			return -errno;
+		snapcast_connect(t);
+		return 0;
+	}
+	return -ENOENT;
+}
+
+static int parse_audio_info(struct pw_properties *props, struct spa_audio_info_raw *info)
+{
+	int res;
+
+	if ((res = spa_audio_info_raw_init_dict_keys(info,
+			&SPA_DICT_ITEMS(
+				 SPA_DICT_ITEM(SPA_KEY_AUDIO_FORMAT, DEFAULT_FORMAT),
+				 SPA_DICT_ITEM(SPA_KEY_AUDIO_RATE, SPA_STRINGIFY(DEFAULT_RATE)),
+				 SPA_DICT_ITEM(SPA_KEY_AUDIO_POSITION, DEFAULT_POSITION)),
+			&props->dict,
+			SPA_KEY_AUDIO_FORMAT,
+			SPA_KEY_AUDIO_RATE,
+			SPA_KEY_AUDIO_CHANNELS,
+			SPA_KEY_AUDIO_LAYOUT,
+			SPA_KEY_AUDIO_POSITION, NULL)) < 0)
+		return res;
+
+	pw_properties_set(props, PW_KEY_AUDIO_FORMAT,
+			spa_type_audio_format_to_short_name(info->format));
+	pw_properties_setf(props, PW_KEY_AUDIO_RATE, "%d", info->rate);
+	pw_properties_setf(props, PW_KEY_AUDIO_CHANNELS, "%d", info->channels);
+	return res;
+}
+
+static int create_stream(struct impl *impl, struct pw_properties *props,
+		struct tunnel *t)
+{
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res = 0;
+	struct pw_impl_module *mod;
+	const struct pw_properties *mod_props;
+	const char *str;
+
+	if ((str = pw_properties_get(props, "snapcast.stream-name")) == NULL)
+		pw_properties_setf(props, "snapcast.stream-name",
+				"PipeWire-%s", pw_get_host_name());
+	if ((str = pw_properties_get(props, "snapcast.stream-name")) == NULL)
+		str = "PipeWire";
+	t->stream_name = strdup(str);
+	if (t->stream_name == NULL)
+		return -errno;
+
+	if ((str = pw_properties_get(props, "capture")) == NULL)
+		pw_properties_set(props, "capture", "true");
+	if ((str = pw_properties_get(props, "capture.props")) == NULL)
+		pw_properties_set(props, "capture.props", "{ media.class = Audio/Sink }");
+
+	if ((res = parse_audio_info(props, &t->audio_info)) < 0) {
+		pw_log_error("Can't parse format: %s", spa_strerror(res));
+		goto done;
+	}
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0) {
+		pw_log_error("Can't open memstream: %m");
+		goto done;
+	}
+
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &props->dict, 0);
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		goto done;
+
+	pw_log_info("loading module args:'%s'", args);
+	mod = pw_context_load_module(impl->context,
+			"libpipewire-module-protocol-simple",
+			args, NULL);
+
+	if (mod == NULL) {
+		res = -errno;
+		pw_log_error("Can't load module: %m");
+                goto done;
+	}
+
+	pw_impl_module_add_listener(mod, &t->module_listener, &submodule_events, t);
+	t->module = mod;
+
+	if ((mod_props = pw_impl_module_get_properties(mod)) != NULL) {
+		const char *addr;
+		if ((addr = pw_properties_get(mod_props, "server.address"))) {
+			add_snapcast_stream(impl, t, props, addr);
+		}
+	}
+done:
+	return res;
+}
+
+struct match_info {
+	struct impl *impl;
+	struct pw_properties *props;
+	struct tunnel *tunnel;
+	bool matched;
+};
+
+static int rule_matched(void *data, const char *location, const char *action,
+                        const char *str, size_t len)
+{
+	struct match_info *i = data;
+	int res = 0;
+
+	i->matched = true;
+	if (spa_streq(action, "create-stream")) {
+		pw_properties_update_string(i->props, str, len);
+		create_stream(i->impl, i->props, i->tunnel);
+	}
+	return res;
+}
+
+static void on_zeroconf_added(void *data, const void *user, const struct spa_dict *info)
+{
+	struct impl *impl = data;
+	struct tunnel_info tinfo;
+	struct tunnel *t;
+	const char *name, *address, *str;
+	struct pw_properties *props = NULL;
+	char hbuf[NI_MAXHOST];
+	struct ifreq ifreq;
+	int res, family, port = 0, ifindex = 0, protocol = 4;
+	const struct spa_dict_item *it;
+
+	if ((str = spa_dict_lookup(info, PW_KEY_ZEROCONF_IFINDEX)))
+		ifindex = atoi(str);
+	if ((str = spa_dict_lookup(info, PW_KEY_ZEROCONF_PROTO)))
+		protocol = atoi(str);
+	name = spa_dict_lookup(info, PW_KEY_ZEROCONF_NAME);
+	address = spa_dict_lookup(info, PW_KEY_ZEROCONF_ADDRESS);
+	if ((str = spa_dict_lookup(info, PW_KEY_ZEROCONF_PORT)))
+		port = atoi(str);
+
+	tinfo = TUNNEL_INFO(.name = name, .port = port);
+
+	t = find_tunnel(impl, &tinfo);
+	if (t == NULL)
+		t = make_tunnel(impl, &tinfo);
+	if (t == NULL) {
+		pw_log_error("Can't make tunnel: %m");
+		goto done;
+	}
+	if (t->module != NULL) {
+		pw_log_info("found duplicate mdns entry for %s on IP %s - skipping tunnel creation",
+				name, address);
+		goto done;
+	}
+
+	props = pw_properties_new(NULL, NULL);
+	if (props == NULL) {
+		pw_log_error("Can't allocate properties: %m");
+		goto done;
+	}
+
+	pw_properties_set(props, "snapcast.ip", address);
+	pw_properties_setf(props, "snapcast.ifindex", "%u", ifindex);
+	pw_properties_setf(props, "snapcast.port", "%u", port);
+	pw_properties_set(props, "snapcast.name", name);
+	pw_properties_set(props, "snapcast.hostname", spa_dict_lookup(info, PW_KEY_ZEROCONF_HOSTNAME));
+	pw_properties_set(props, "snapcast.domain", spa_dict_lookup(info, PW_KEY_ZEROCONF_DOMAIN));
+
+	free((char*)t->info.host);
+	t->info.host = strdup(pw_properties_get(props, "snapcast.ip"));
+	if (t->info.host == NULL)
+		return;
+
+	family = protocol == 4 ? AF_INET : AF_INET6;
+
+	spa_zero(ifreq);
+	ifreq.ifr_ifindex = ifindex;
+	if_indextoname(ifindex, ifreq.ifr_name);
+	pw_properties_set(props, "snapcast.ifname", ifreq.ifr_name);
+	pw_properties_set(props, "local.ifname", ifreq.ifr_name);
+
+	struct ifaddrs *if_addr, *ifp;
+	if (getifaddrs(&if_addr) < 0)
+		pw_log_error("error: %m");
+
+	for (ifp = if_addr; ifp != NULL; ifp = ifp->ifa_next) {
+		if (ifp->ifa_addr == NULL)
+			continue;
+
+		if (spa_streq(ifp->ifa_name, ifreq.ifr_name) &&
+		    ifp->ifa_addr->sa_family == family) {
+			break;
+		}
+	}
+	if (ifp != NULL) {
+		if ((res = getnameinfo((struct sockaddr *)ifp->ifa_addr,
+				(family == AF_INET) ? sizeof(struct sockaddr_in) :
+						sizeof(struct sockaddr_in6),
+				hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST)) == 0) {
+			pw_properties_setf(props, "server.address", "[ \"tcp:%s%s%s:0\" ]",
+					family == AF_INET ? "" : "[",
+					hbuf,
+					family == AF_INET ? "" : "]");
+			pw_properties_setf(props, "local.ifaddress", "%s%s%s",
+					family == AF_INET ? "" : "[",
+					hbuf,
+					family == AF_INET ? "" : "]");
+		} else {
+			pw_log_warn("error: %m %d %s", res, gai_strerror(res));
+		}
+	}
+	freeifaddrs(if_addr);
+
+	spa_dict_for_each(it, info)
+		pw_properties_from_zeroconf(it->key, it->value, props);
+
+	if ((str = pw_properties_get(impl->properties, "stream.rules")) == NULL)
+		str = DEFAULT_CREATE_RULES;
+	if (str != NULL) {
+		struct match_info minfo = {
+			.impl = impl,
+			.props = props,
+			.tunnel = t,
+		};
+		pw_conf_match_rules(str, strlen(str), NAME, &props->dict,
+				rule_matched, &minfo);
+
+		if (!minfo.matched)
+			pw_log_info("unmatched service found %s", str);
+	}
+
+done:
+	pw_properties_free(props);
+}
+
+
+static void on_zeroconf_removed(void *data, const void *user, const struct spa_dict *info)
+{
+	struct impl *impl = data;
+	struct tunnel *t;
+	struct tunnel_info tinfo;
+	const char *name;
+
+	name = spa_dict_lookup(info, PW_KEY_ZEROCONF_NAME);
+
+	tinfo = TUNNEL_INFO(.name = name);
+
+	t = find_tunnel(impl, &tinfo);
+	if (t == NULL)
+		return;
+
+	free_tunnel(t);
+}
+
+static int make_browser(struct impl *impl, const char *service_type)
+{
+	int res;
+	if ((res = pw_zeroconf_set_browse(impl->zeroconf, service_type,
+		&SPA_DICT_ITEMS(
+			SPA_DICT_ITEM(PW_KEY_ZEROCONF_TYPE, service_type)))) < 0) {
+		pw_log_error("can't make browser for %s: %s",
+				service_type, spa_strerror(res));
+		return res;
+	}
+	return 0;
+}
+
+static const struct pw_zeroconf_events zeroconf_events = {
+	PW_VERSION_ZEROCONF_EVENTS,
+	.added = on_zeroconf_added,
+	.removed = on_zeroconf_removed,
+};
+
+SPA_EXPORT
+int pipewire__module_init(struct pw_impl_module *module, const char *args)
+{
+	struct pw_context *context = pw_impl_module_get_context(module);
+	struct pw_properties *props;
+	struct impl *impl;
+	int res;
+
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	impl = calloc(1, sizeof(struct impl));
+	if (impl == NULL)
+		goto error_errno;
+
+	pw_log_debug("module %p: new %s", impl, args);
+
+	if (args == NULL)
+		args = "";
+
+	props = pw_properties_new_string(args);
+	if (props == NULL)
+		goto error_errno;
+
+	spa_list_init(&impl->tunnel_list);
+
+	impl->loop = pw_context_get_main_loop(context);
+	impl->module = module;
+	impl->context = context;
+	impl->properties = props;
+
+	impl->discover_local =  pw_properties_get_bool(impl->properties,
+			"snapcast.discover-local", false);
+	pw_properties_set(props, PW_KEY_ZEROCONF_DISCOVER_LOCAL,
+			impl->discover_local ? "true" : "false");
+
+	impl->zeroconf = pw_zeroconf_new(impl->context, &props->dict);
+	if (impl->zeroconf == NULL) {
+		pw_log_error("can't create zeroconf: %m");
+		goto error_errno;
+	}
+	pw_zeroconf_add_listener(impl->zeroconf, &impl->zeroconf_listener,
+			&zeroconf_events, impl);
+
+	make_browser(impl, SERVICE_TYPE_CONTROL);
+	make_browser(impl, SERVICE_TYPE_JSONRPC);
+
+	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
+
+	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(module_props));
+
+	return 0;
+
+error_errno:
+	res = -errno;
+	if (impl)
+		impl_free(impl);
+	return res;
+}

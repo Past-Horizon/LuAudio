@@ -1,0 +1,205 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-FileCopyrightText: Copyright © 2021 Sanchayan Maity <sanchayan@asymptotic.io> */
+/* SPDX-License-Identifier: MIT */
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <spa/utils/cleanup.h>
+#include <spa/utils/json-builder.h>
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/utils/hook.h>
+
+#include "../defs.h"
+#include "../module.h"
+
+/** \page page_pulse_module_pipe_sink Pipe Sink
+ *
+ * ## Module Name
+ *
+ * `module-pipe-sink`
+ *
+ * ## Module Options
+ *
+ * @pulse_module_options@
+ *
+ * ## See Also
+ *
+ * \ref page_module_pipe_tunnel "libpipewire-module-pipe-tunnel"
+ */
+
+
+static const struct module_args valid_args[] = {
+	{ "file", "name of the FIFO special file to use", 0, MODULE_TYPE_STRING, NULL },
+	{ "sink_name", "name for the sink", 0, MODULE_TYPE_STRING, "fifo_output" },
+	{ "sink_properties", "sink properties", 0, MODULE_TYPE_PROPS, NULL },
+	{ "format", "sample format", 0, MODULE_TYPE_FORMAT, NULL },
+	{ "rate", "sample rate", 0, MODULE_TYPE_INT, NULL },
+	{ "channels", "number of channels", 0, MODULE_TYPE_INT, NULL },
+	{ "channel_map", "channel map", 0, MODULE_TYPE_CHMAP, NULL },
+	{ "use_system_clock_for_timing", "use system clock for timing", 0, MODULE_TYPE_BOOL, NULL },
+	{ NULL, }
+};
+
+#define NAME "pipe-sink"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+struct module_pipesink_data {
+	struct module *module;
+
+	struct spa_hook mod_listener;
+	struct pw_impl_module *mod;
+
+	struct pw_properties *global_props;
+	struct pw_properties *stream_props;
+};
+
+static void module_destroy(void *data)
+{
+	struct module_pipesink_data *d = data;
+	spa_hook_remove(&d->mod_listener);
+	d->mod = NULL;
+	module_schedule_unload(d->module);
+}
+
+static const struct pw_impl_module_events module_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = module_destroy
+};
+
+static int module_pipe_sink_load(struct module *module)
+{
+	struct module_pipesink_data *data = module->user_data;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res;
+
+	pw_properties_setf(data->stream_props, "pulse.module.id",
+			"%u", module->index);
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+		return res;
+
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &data->global_props->dict, 0);
+	spa_json_builder_object_push(&b,  "stream.props", "{");
+	pw_properties_serialize_dict(b.f, &data->stream_props->dict, 0);
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
+
+	data->mod = pw_context_load_module(module->impl->context,
+			"libpipewire-module-pipe-tunnel",
+			args, NULL);
+
+	if (data->mod == NULL)
+		return -errno;
+
+	pw_impl_module_add_listener(data->mod,
+			&data->mod_listener,
+			&module_events, data);
+	return 0;
+}
+
+static int module_pipe_sink_unload(struct module *module)
+{
+	struct module_pipesink_data *d = module->user_data;
+
+	if (d->mod) {
+		spa_hook_remove(&d->mod_listener);
+		pw_impl_module_destroy(d->mod);
+		d->mod = NULL;
+	}
+	pw_properties_free(d->stream_props);
+	pw_properties_free(d->global_props);
+	return 0;
+}
+
+static const struct spa_dict_item module_pipe_sink_info[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Sanchayan Maity <sanchayan@asymptotic.io>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Pipe sink" },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+static int module_pipe_sink_prepare(struct module * const module)
+{
+	struct module_pipesink_data * const d = module->user_data;
+	struct pw_properties * const props = module->props;
+	struct pw_properties *global_props = NULL, *stream_props = NULL;
+	struct spa_audio_info_raw info = { 0 };
+	const char *str;
+	bool use_system_clock;
+	int res = 0;
+
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	global_props = pw_properties_new(NULL, NULL);
+	stream_props = pw_properties_new(NULL, NULL);
+	if (!global_props || !stream_props) {
+		res = -EINVAL;
+		goto out;
+	}
+
+	pw_properties_set(global_props, "tunnel.mode", "sink");
+
+	info.format = SPA_AUDIO_FORMAT_S16;
+	if (module_args_to_audioinfo_keys(module->impl, props,
+			"format", "rate", "channels", "channel_map", &info) < 0) {
+		res = -EINVAL;
+		goto out;
+	}
+	audioinfo_to_properties(&info, global_props);
+
+	if ((str = pw_properties_get(props, "sink_name")) != NULL) {
+		pw_properties_set(stream_props, PW_KEY_NODE_NAME, str);
+		pw_properties_set(props, "sink_name", NULL);
+	}
+	if ((str = pw_properties_get(props, "sink_properties")) != NULL)
+		module_args_add_props(stream_props, str);
+
+	if ((str = pw_properties_get(props, "file")) != NULL) {
+		pw_properties_set(global_props, "pipe.filename", str);
+		pw_properties_set(props, "file", NULL);
+	}
+	str = pw_properties_get(props, "use_system_clock_for_timing");
+	use_system_clock = str ? module_args_parse_bool(str) : false;
+
+	if ((str = pw_properties_get(stream_props, PW_KEY_NODE_GROUP)) == NULL) {
+		if (use_system_clock)
+			pw_properties_set(stream_props, PW_KEY_NODE_GROUP,
+				"pipewire.dummy");
+	}
+	if ((str = pw_properties_get(stream_props, PW_KEY_DEVICE_ICON_NAME)) == NULL)
+		pw_properties_set(stream_props, PW_KEY_DEVICE_ICON_NAME,
+				"audio-card");
+	if ((str = pw_properties_get(stream_props, PW_KEY_NODE_NAME)) == NULL)
+		pw_properties_set(stream_props, PW_KEY_NODE_NAME,
+				"fifo_output");
+
+	d->module = module;
+	d->global_props = global_props;
+	d->stream_props = stream_props;
+
+	return 0;
+out:
+	pw_properties_free(global_props);
+	pw_properties_free(stream_props);
+	return res;
+}
+
+DEFINE_MODULE_INFO(module_pipe_sink) = {
+	.name = "module-pipe-sink",
+	.valid_args = valid_args,
+	.prepare = module_pipe_sink_prepare,
+	.load = module_pipe_sink_load,
+	.unload = module_pipe_sink_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_pipe_sink_info),
+	.data_size = sizeof(struct module_pipesink_data),
+};

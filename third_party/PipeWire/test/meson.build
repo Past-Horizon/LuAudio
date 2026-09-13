@@ -1,0 +1,216 @@
+pwtest_sources = [
+  'pwtest.h',
+  'pwtest-implementation.h',
+  'pwtest.c',
+  'pwtest-compat.c',
+]
+
+pwtest_deps = [
+  pipewire_dep,
+  mathlib,
+  dl_lib,
+  epoll_shim_dep
+]
+
+pwtest_c_args = [
+  '-DBUILD_ROOT="@0@"'.format(meson.project_build_root()),
+  '-DSOURCE_ROOT="@0@"'.format(meson.project_source_root()),
+]
+
+pwtest_inc = [
+  pipewire_inc,
+  configinc,
+  includes_inc,
+]
+
+pwtest_lib = static_library(
+  'pwtest',
+  pwtest_sources,
+  c_args: pwtest_c_args,
+  dependencies: pwtest_deps,
+  include_directories: pwtest_inc,
+)
+
+test('test-pwtest',
+    executable('test-pwtest',
+               'test-pwtest.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep ],
+               link_with: pwtest_lib)
+)
+
+# Compilation only, this is the example file for how pwtest works and most
+# of its tests will fail.
+executable('test-example',
+  'test-example.c',
+  include_directories: pwtest_inc,
+  dependencies: [ spa_dep ],
+  link_with: pwtest_lib)
+
+test('test-pw-utils',
+    executable('test-pw-utils',
+               'test-properties.c',
+               'test-array.c',
+               'test-map.c',
+               'test-mempool.c',
+               'test-utils.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-lib',
+    executable('test-lib',
+               'test-lib.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-client',
+    executable('test-client',
+               'test-client.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep ],
+               link_with: pwtest_lib)
+)
+
+test('test-loop',
+    executable('test-loop',
+               'test-loop.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep, epoll_shim_dep ],
+               link_with: pwtest_lib)
+)
+
+if get_option('spa-plugins').allowed()
+test('test-context',
+    executable('test-context',
+               'test-context.c',
+               'test-config.c',
+               'test-conf-match-rules.c',
+               include_directories: pwtest_inc,
+               dependencies: [spa_dep, spa_support_dep, spa_dbus_dep],
+               link_with: [pwtest_lib,
+                            pipewire_module_protocol_native,
+                            pipewire_module_client_node,
+                            pipewire_module_client_device,
+                            pipewire_module_adapter,
+                            pipewire_module_metadata,
+                            pipewire_module_session_manager])
+)
+
+test('test-support',
+    executable('test-support',
+               'test-support.c',
+               'test-logger.c',
+               include_directories: pwtest_inc,
+               dependencies: [spa_dep, systemd_dep, spa_support_dep, spa_journal_dep],
+               link_with: [pwtest_lib])
+)
+endif
+test('test-spa',
+    executable('test-spa',
+               'test-spa-buffer.c',
+               'test-spa-control.c',
+               'test-spa-format.c',
+               'test-spa-json.c',
+               'test-spa-utils.c',
+               'test-spa-log.c',
+               'test-spa-node.c',
+               'test-spa-pod.c',
+               include_directories: pwtest_inc,
+               dependencies: [ spa_dep ],
+               link_with: pwtest_lib)
+)
+
+openal_info = find_program('openal-info', required: false)
+if openal_info.found()
+    cdata.set_quoted('OPENAL_INFO_PATH', openal_info.full_path())
+endif
+summary({'openal-info': openal_info.found()}, bool_yn: true, section: 'Functional test programs')
+
+pactl = find_program('pactl', required: false)
+if pactl.found()
+    cdata.set_quoted('PACTL_PATH', pactl.full_path())
+endif
+summary({'pactl': pactl.found()}, bool_yn: true, section: 'Functional test programs')
+
+if default_sm == 'media-session' or default_sm == 'wireplumber'
+  test_functional_c_args = []
+  if get_option('b_sanitize').contains('address')
+    test_functional_c_args += ['-DHAVE_ASAN']
+  endif
+  test('test-functional',
+    executable('test-functional',
+               'test-functional.c',
+               include_directories: pwtest_inc,
+               c_args: [test_functional_c_args],
+               dependencies: [ spa_dep ],
+               link_with: pwtest_lib)
+  )
+endif
+
+valgrind = find_program('valgrind', required: false)
+summary({'valgrind (test setup)': valgrind.found()}, bool_yn: true, section: 'Optional programs')
+if valgrind.found()
+  valgrind_env = environment({'PIPEWIRE_DEBUG': 'D'})
+  add_test_setup('valgrind',
+                 exe_wrapper : [ valgrind,
+                   '--leak-check=full',
+                   '--gen-suppressions=all',
+                   '--error-exitcode=3',
+                   ],
+                 env :  valgrind_env,
+                 timeout_multiplier : 3)
+endif
+
+if build_avb_virtual
+  avb_test_inc = [pwtest_inc, include_directories('../src/modules')]
+  avb_module_sources = [
+    '../src/modules/module-avb/avb.c',
+    '../src/modules/module-avb/adp.c',
+    '../src/modules/module-avb/acmp.c',
+    '../src/modules/module-avb/acmp-cmds-resps/acmp-common.c',
+    '../src/modules/module-avb/acmp-cmds-resps/acmp-legacy-avb.c',
+    '../src/modules/module-avb/acmp-cmds-resps/acmp-milan-v12.c',
+    '../src/modules/module-avb/aecp.c',
+    '../src/modules/module-avb/aecp-aem.c',
+    '../src/modules/module-avb/aecp-vendor-unique-milan-v12.c',
+    '../src/modules/module-avb/aecp-vendor-unique-milan-v12-cmds-resps/cmd-get-milan-info.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-available.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-control.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-name.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-clock-source.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-sampling-rate.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-deregister-unsolicited-notifications.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-register-unsolicited-notifications.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-stream-format.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-lock-entity.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-configuration.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-dynamic-info.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-stream-info.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-start-stop-streaming.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-counters.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-as-path.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/cmd-get-set-max-transit-time.c',
+    '../src/modules/module-avb/aecp-aem-cmds-resps/reply-unsol-helpers.c',
+    '../src/modules/module-avb/es-builder.c',
+    '../src/modules/module-avb/avdecc.c',
+    '../src/modules/module-avb/descriptors.c',
+    '../src/modules/module-avb/maap.c',
+    '../src/modules/module-avb/mmrp.c',
+    '../src/modules/module-avb/mrp.c',
+    '../src/modules/module-avb/msrp.c',
+    '../src/modules/module-avb/mvrp.c',
+    '../src/modules/module-avb/srp.c',
+    '../src/modules/module-avb/stream.c',
+  ]
+  test('test-avb',
+      executable('test-avb',
+                 ['test-avb.c'] + avb_module_sources,
+                 include_directories: avb_test_inc,
+                 dependencies: [spa_dep, pipewire_dep, mathlib, dl_lib, rt_lib],
+                 link_with: pwtest_lib)
+  )
+endif

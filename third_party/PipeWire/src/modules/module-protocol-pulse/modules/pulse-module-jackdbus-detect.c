@@ -1,0 +1,235 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
+
+#include <spa/utils/cleanup.h>
+#include <spa/utils/hook.h>
+#include <spa/utils/json-builder.h>
+#include <pipewire/pipewire.h>
+
+#include "../defs.h"
+#include "../module.h"
+
+/** \page page_pulse_module_jackdbus_detect JackDBus Detect
+ *
+ * ## Module Name
+ *
+ * `module-jackdbus-detect`
+ *
+ * ## Module Options
+ *
+ * @pulse_module_options@
+ *
+ * ## See Also
+ *
+ * \ref page_module_jackdbus_detect "libpipewire-module-jackdbus-detect"
+ */
+
+
+static const struct module_args valid_args[] = {
+	{ "channels", "number of channels", 0, MODULE_TYPE_INT, NULL },
+	{ "sink_name", "name for the sink", 0, MODULE_TYPE_STRING, "jack_out" },
+	{ "sink_properties", "properties for the sink", 0, MODULE_TYPE_PROPS, NULL },
+	{ "sink_client_name", "jack client name", 0, MODULE_TYPE_STRING, NULL },
+	{ "sink_channels", "number of channels", 0, MODULE_TYPE_INT, NULL },
+	{ "sink_channel_map", "channel map", 0, MODULE_TYPE_CHMAP, NULL },
+	{ "source_name", "name for the source", 0, MODULE_TYPE_STRING, "jack_in" },
+	{ "source_properties", "properties for the source", 0, MODULE_TYPE_PROPS, NULL },
+	{ "source_client_name", "jack client name", 0, MODULE_TYPE_STRING, NULL },
+	{ "source_channels", "number of channels", 0, MODULE_TYPE_INT, NULL },
+	{ "source_channel_map", "channel map", 0, MODULE_TYPE_CHMAP, NULL },
+	{ "connect", "connect ports", 0, MODULE_TYPE_BOOL, NULL },
+	{ NULL, }
+};
+
+#define NAME "jackdbus-detect"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+
+struct module_jackdbus_detect_data {
+	struct module *module;
+
+	struct spa_hook mod_listener;
+	struct pw_impl_module *mod;
+
+	struct pw_properties *props;
+	struct pw_properties *sink_props;
+	struct pw_properties *source_props;
+};
+
+static void module_destroy(void *data)
+{
+	struct module_jackdbus_detect_data *d = data;
+	spa_hook_remove(&d->mod_listener);
+	d->mod = NULL;
+	module_schedule_unload(d->module);
+}
+
+static const struct pw_impl_module_events module_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = module_destroy
+};
+
+static int module_jackdbus_detect_load(struct module *module)
+{
+	struct module_jackdbus_detect_data *data = module->user_data;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res;
+
+	pw_properties_setf(data->sink_props, "pulse.module.id",
+			"%u", module->index);
+	pw_properties_setf(data->source_props, "pulse.module.id",
+			"%u", module->index);
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+		return res;
+
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &data->props->dict, 0);
+	spa_json_builder_object_push(&b,  "source.props", "{");
+	pw_properties_serialize_dict(b.f, &data->source_props->dict, 0);
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_object_push(&b,  "sink.props", "{");
+	pw_properties_serialize_dict(b.f, &data->sink_props->dict, 0);
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
+
+	data->mod = pw_context_load_module(module->impl->context,
+			"libpipewire-module-jackdbus-detect",
+			args, NULL);
+
+	if (data->mod == NULL)
+		return -errno;
+
+	pw_impl_module_add_listener(data->mod,
+			&data->mod_listener,
+			&module_events, data);
+
+	return 0;
+}
+
+static int module_jackdbus_detect_unload(struct module *module)
+{
+	struct module_jackdbus_detect_data *d = module->user_data;
+
+	if (d->mod) {
+		spa_hook_remove(&d->mod_listener);
+		pw_impl_module_destroy(d->mod);
+		d->mod = NULL;
+	}
+
+	pw_properties_free(d->props);
+	pw_properties_free(d->sink_props);
+	pw_properties_free(d->source_props);
+
+	return 0;
+}
+
+static const struct spa_dict_item module_jackdbus_detect_info[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.con>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Creates a JACK client when jackdbus is started" },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+static int module_jackdbus_detect_prepare(struct module * const module)
+{
+	struct module_jackdbus_detect_data * const data = module->user_data;
+	struct pw_properties * const props = module->props;
+	struct pw_properties *jack_props = NULL, *sink_props = NULL, *source_props = NULL;
+	struct spa_audio_info_raw info;
+	const char *str;
+	int res;
+
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	jack_props = pw_properties_new(NULL, NULL);
+	sink_props = pw_properties_new(NULL, NULL);
+	source_props = pw_properties_new(NULL, NULL);
+	if (jack_props == NULL || sink_props == NULL || source_props == NULL) {
+		res = -ENOMEM;
+		goto out;
+	}
+
+	if ((str = pw_properties_get(props, "channels")) != NULL) {
+		pw_properties_set(jack_props, PW_KEY_AUDIO_CHANNELS, str);
+		pw_properties_set(props, "channels", NULL);
+	}
+	if ((str = pw_properties_get(props, "connect")) != NULL) {
+		pw_properties_set(jack_props, "jack.connect",
+				module_args_parse_bool(str) ? "true" : "false");
+	}
+
+	if ((str = pw_properties_get(props, "sink_name")) != NULL) {
+		pw_properties_set(sink_props, PW_KEY_NODE_NAME, str);
+		pw_properties_set(props, "sink_name", NULL);
+	} else {
+		pw_properties_set(sink_props, PW_KEY_NODE_NAME, "jack_out");
+	}
+	if ((str = pw_properties_get(props, "sink_client_name")) != NULL) {
+		pw_properties_set(jack_props, "jack.client-name", str);
+		pw_properties_set(props, "sink_client_name", NULL);
+	}
+
+	spa_zero(info);
+	if ((res = module_args_to_audioinfo_keys(module->impl, props, NULL, NULL,
+			"sink_channels", "sink_channel_map", &info)) < 0) {
+		goto out;
+	} else {
+		audioinfo_to_properties(&info, sink_props);
+	}
+	if ((str = pw_properties_get(props, "sink_properties")) != NULL) {
+		module_args_add_props(sink_props, str);
+		pw_properties_set(props, "sink_properties", NULL);
+	}
+
+	if ((str = pw_properties_get(props, "source_name")) != NULL) {
+		pw_properties_set(source_props, PW_KEY_NODE_NAME, str);
+		pw_properties_set(props, "source_name", NULL);
+	} else {
+		pw_properties_set(source_props, PW_KEY_NODE_NAME, "jack_in");
+	}
+	if ((str = pw_properties_get(props, "source_client_name")) != NULL) {
+		pw_properties_set(jack_props, "jack.client-name", str);
+		pw_properties_set(props, "source_client_name", NULL);
+	}
+	spa_zero(info);
+	if ((res = module_args_to_audioinfo_keys(module->impl, props, NULL, NULL,
+			"source_channels", "source_channel_map", &info)) < 0) {
+		goto out;
+	} else {
+		audioinfo_to_properties(&info, source_props);
+	}
+	if ((str = pw_properties_get(props, "source_properties")) != NULL) {
+		module_args_add_props(source_props, str);
+		pw_properties_set(props, "source_properties", NULL);
+	}
+
+	data->module = module;
+	data->props = jack_props;
+	data->sink_props = sink_props;
+	data->source_props = source_props;
+
+	return 0;
+out:
+	pw_properties_free(jack_props);
+	pw_properties_free(sink_props);
+	pw_properties_free(source_props);
+	return res;
+}
+
+DEFINE_MODULE_INFO(module_jackdbus_detect) = {
+	.name = "module-jackdbus-detect",
+	.load_once = false,
+	.valid_args = valid_args,
+	.prepare = module_jackdbus_detect_prepare,
+	.load = module_jackdbus_detect_load,
+	.unload = module_jackdbus_detect_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_jackdbus_detect_info),
+	.data_size = sizeof(struct module_jackdbus_detect_data),
+};

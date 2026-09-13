@@ -1,0 +1,214 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
+
+#include <spa/utils/cleanup.h>
+#include <spa/utils/json-builder.h>
+#include <pipewire/impl.h>
+#include <pipewire/pipewire.h>
+
+#include "../defs.h"
+#include "../module.h"
+
+/** \page page_pulse_module_simple_protocol_tcp Simple TCP Protocol
+ *
+ * ## Module Name
+ *
+ * `module-simple-protocol-tcp`
+ *
+ * ## Module Options
+ *
+ * @pulse_module_options@
+ *
+ * ## See Also
+ *
+ * \ref page_module_protocol_simple "libpipewire-module-protocol-simple"
+ */
+
+
+static const struct module_args valid_args[] = {
+	{ "rate", "sample rate", 0, MODULE_TYPE_INT, NULL },
+	{ "format", "sample format", 0, MODULE_TYPE_FORMAT, NULL },
+	{ "channels", "number of channels", 0, MODULE_TYPE_INT, NULL },
+	{ "channel_map", "number of channels", 0, MODULE_TYPE_CHMAP, NULL },
+	{ "sink", "sink to connect to", 0, MODULE_TYPE_STRING, NULL },
+	{ "source", "source to connect to", 0, MODULE_TYPE_STRING, NULL },
+	{ "playback", "enable playback", 0, MODULE_TYPE_BOOL, NULL },
+	{ "record", "enable record", 0, MODULE_TYPE_BOOL, NULL },
+	{ "port", "TCP port number", 0, MODULE_TYPE_INT, "4711" },
+	{ "listen", "address to listen on", 0, MODULE_TYPE_STRING, NULL },
+	{ NULL, }
+};
+
+#define NAME "simple-protocol-tcp"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+struct module_simple_protocol_tcp_data {
+	struct module *module;
+	struct pw_impl_module *mod;
+	struct spa_hook mod_listener;
+
+	struct pw_properties *module_props;
+
+	struct spa_audio_info_raw info;
+};
+
+static void module_destroy(void *data)
+{
+	struct module_simple_protocol_tcp_data *d = data;
+
+	spa_hook_remove(&d->mod_listener);
+	d->mod = NULL;
+
+	module_schedule_unload(d->module);
+}
+
+static const struct pw_impl_module_events module_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = module_destroy
+};
+
+static int module_simple_protocol_tcp_load(struct module *module)
+{
+	struct module_simple_protocol_tcp_data *data = module->user_data;
+	struct impl *impl = module->impl;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res;
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+		return res;
+
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &data->module_props->dict, 0);
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
+
+	data->mod = pw_context_load_module(impl->context,
+			"libpipewire-module-protocol-simple",
+			args, NULL);
+
+	if (data->mod == NULL)
+		return -errno;
+
+	pw_impl_module_add_listener(data->mod, &data->mod_listener, &module_events, data);
+
+	return 0;
+}
+
+static int module_simple_protocol_tcp_unload(struct module *module)
+{
+	struct module_simple_protocol_tcp_data *d = module->user_data;
+
+	if (d->mod != NULL) {
+		spa_hook_remove(&d->mod_listener);
+		pw_impl_module_destroy(d->mod);
+	}
+
+	pw_properties_free(d->module_props);
+
+	return 0;
+}
+
+static const struct spa_dict_item module_simple_protocol_tcp_info[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Simple protocol (TCP sockets)" },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+static int module_simple_protocol_tcp_prepare(struct module * const module)
+{
+	struct module_simple_protocol_tcp_data * const d = module->user_data;
+	struct pw_properties * const props = module->props;
+	struct pw_properties *module_props = NULL;
+	const char *str, *port, *listen;
+	struct spa_audio_info_raw info = { 0 };
+	int res;
+
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	module_props = pw_properties_new(NULL, NULL);
+	if (module_props == NULL) {
+		res = -errno;
+		goto out;
+	}
+
+	if (module_args_to_audioinfo_keys(module->impl, props,
+			"format", "rate", "channels", "channel_map", &info) < 0) {
+		res = -EINVAL;
+		goto out;
+	}
+	audioinfo_to_properties(&info, module_props);
+
+	if ((str = pw_properties_get(props, "playback")) != NULL) {
+		pw_properties_set(module_props, "playback", str);
+		pw_properties_set(props, "playback", NULL);
+	}
+	if ((str = pw_properties_get(props, "record")) != NULL) {
+		pw_properties_set(module_props, "capture", str);
+		pw_properties_set(props, "record", NULL);
+	}
+
+	if ((str = pw_properties_get(props, "source")) != NULL) {
+		if (spa_strendswith(str, ".monitor")) {
+			pw_properties_setf(module_props, "capture.node",
+					"%.*s", (int)strlen(str)-8, str);
+			pw_properties_set(module_props, PW_KEY_STREAM_CAPTURE_SINK,
+					"true");
+		} else {
+			pw_properties_set(module_props, "capture.node", str);
+		}
+		pw_properties_set(props, "source", NULL);
+	}
+
+	if ((str = pw_properties_get(props, "sink")) != NULL) {
+		pw_properties_set(module_props, "playback.node", str);
+		pw_properties_set(props, "sink", NULL);
+	}
+
+	if ((port = pw_properties_get(props, "port")) == NULL)
+		port = "4711";
+	listen = pw_properties_get(props, "listen");
+
+	{
+		struct spa_json_builder ab;
+		spa_autofree char *addr = NULL;
+		size_t addr_size;
+
+		if ((res = spa_json_builder_memstream(&ab, &addr, &addr_size, 0)) < 0)
+			goto out;
+
+		spa_json_builder_array_push(&ab, "[");
+		spa_json_builder_array_stringf(&ab, "tcp:%s%s%s",
+				listen ? listen : "", listen ? ":" : "", port);
+		spa_json_builder_pop(&ab,        "]");
+		if ((res = spa_json_builder_close(&ab)) < 0)
+			goto out;
+
+		pw_properties_set(module_props, "server.address", addr);
+	}
+
+	d->module = module;
+	d->module_props = module_props;
+	d->info = info;
+
+	return 0;
+out:
+	pw_properties_free(module_props);
+
+	return res;
+}
+
+DEFINE_MODULE_INFO(module_simple_protocol_tcp) = {
+	.name = "module-simple-protocol-tcp",
+	.valid_args = valid_args,
+	.prepare = module_simple_protocol_tcp_prepare,
+	.load = module_simple_protocol_tcp_load,
+	.unload = module_simple_protocol_tcp_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_simple_protocol_tcp_info),
+	.data_size = sizeof(struct module_simple_protocol_tcp_data),
+};

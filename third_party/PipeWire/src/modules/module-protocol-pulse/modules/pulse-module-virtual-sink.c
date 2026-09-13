@@ -1,0 +1,204 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2023 Wim Taymans <wim.taymans@gmail.com> */
+/* SPDX-License-Identifier: MIT */
+
+#include <spa/param/audio/format-utils.h>
+#include <spa/utils/cleanup.h>
+#include <spa/utils/hook.h>
+#include <spa/utils/json-builder.h>
+#include <pipewire/pipewire.h>
+
+#include "../defs.h"
+#include "../module.h"
+
+/** \page page_pulse_module_virtual_sink Virtual Sink
+ *
+ * ## Module Name
+ *
+ * `module-virtual-sink`
+ *
+ * ## Module Options
+ *
+ * @pulse_module_options@
+ *
+ * ## See Also
+ *
+ * \ref page_module_loopback "libpipewire-module-loopback"
+ */
+
+
+static const struct module_args valid_args[] = {
+	{ "sink_name", "name for the sink", 0, MODULE_TYPE_STRING, "vsink" },
+	{ "sink_properties", "properties for the sink", 0, MODULE_TYPE_PROPS, NULL },
+	{ "master", "name of sink to filter", 0, MODULE_TYPE_STRING, NULL },
+	{ "channels", "number of channels", 0, MODULE_TYPE_INT, NULL },
+	{ "channel_map", "channel map", 0, MODULE_TYPE_CHMAP, NULL },
+	{ "use_volume_sharing", "share volume with master", 0, MODULE_TYPE_BOOL, NULL },
+	{ "force_flat_volume", "force flat volume", 0, MODULE_TYPE_BOOL, NULL },
+	{ NULL, }
+};
+
+#define NAME "virtual-sink"
+
+PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+#define PW_LOG_TOPIC_DEFAULT mod_topic
+
+struct module_virtual_sink_data {
+	struct module *module;
+
+	struct pw_impl_module *mod;
+	struct spa_hook mod_listener;
+
+	struct pw_properties *global_props;
+	struct pw_properties *capture_props;
+	struct pw_properties *playback_props;
+};
+
+static void module_destroy(void *data)
+{
+	struct module_virtual_sink_data *d = data;
+	spa_hook_remove(&d->mod_listener);
+	d->mod = NULL;
+	module_schedule_unload(d->module);
+}
+
+static const struct pw_impl_module_events module_events = {
+	PW_VERSION_IMPL_MODULE_EVENTS,
+	.destroy = module_destroy
+};
+
+static int module_virtual_sink_load(struct module *module)
+{
+	struct module_virtual_sink_data *data = module->user_data;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
+	size_t size;
+	int res;
+
+	pw_properties_setf(data->capture_props, PW_KEY_NODE_GROUP, "virtual-sink-%u", module->index);
+	pw_properties_setf(data->playback_props, PW_KEY_NODE_GROUP, "virtual-sink-%u", module->index);
+	pw_properties_setf(data->capture_props, "pulse.module.id", "%u", module->index);
+	pw_properties_setf(data->playback_props, "pulse.module.id", "%u", module->index);
+
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0)
+		return res;
+
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &data->global_props->dict, 0);
+	spa_json_builder_object_push(&b,  "capture.props", "{");
+	pw_properties_serialize_dict(b.f, &data->capture_props->dict, 0);
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_object_push(&b,  "playback.props", "{");
+	pw_properties_serialize_dict(b.f, &data->playback_props->dict, 0);
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
+
+	data->mod = pw_context_load_module(module->impl->context,
+			"libpipewire-module-loopback",
+			args, NULL);
+
+	if (data->mod == NULL)
+		return -errno;
+
+	pw_impl_module_add_listener(data->mod,
+			&data->mod_listener,
+			&module_events, data);
+
+	return 0;
+}
+
+static int module_virtual_sink_unload(struct module *module)
+{
+	struct module_virtual_sink_data *d = module->user_data;
+
+	if (d->mod) {
+		spa_hook_remove(&d->mod_listener);
+		pw_impl_module_destroy(d->mod);
+		d->mod = NULL;
+	}
+
+	pw_properties_free(d->capture_props);
+	pw_properties_free(d->playback_props);
+	pw_properties_free(d->global_props);
+
+	return 0;
+}
+
+static const struct spa_dict_item module_virtual_sink_info[] = {
+	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Virtual sink" },
+	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
+};
+
+static int module_virtual_sink_prepare(struct module * const module)
+{
+	struct module_virtual_sink_data * const d = module->user_data;
+	struct pw_properties * const props = module->props;
+	struct pw_properties *global_props = NULL, *playback_props = NULL, *capture_props = NULL;
+	const char *str;
+	struct spa_audio_info_raw info = { 0 };
+	int res;
+
+	PW_LOG_TOPIC_INIT(mod_topic);
+
+	global_props = pw_properties_new(NULL, NULL);
+	capture_props = pw_properties_new(NULL, NULL);
+	playback_props = pw_properties_new(NULL, NULL);
+	if (!global_props || !capture_props || !playback_props) {
+		res = -EINVAL;
+		goto out;
+	}
+
+	if ((str = pw_properties_get(props, "sink_name")) != NULL) {
+		pw_properties_set(global_props, PW_KEY_NODE_NAME, str);
+		pw_properties_set(global_props, PW_KEY_NODE_DESCRIPTION, str);
+		pw_properties_set(props, "sink_name", NULL);
+	} else {
+		pw_properties_set(global_props, PW_KEY_NODE_NAME, "vsink");
+		pw_properties_set(global_props, PW_KEY_NODE_DESCRIPTION, "Virtual Sink");
+	}
+	if ((str = pw_properties_get(props, "sink_properties")) != NULL) {
+		module_args_add_props(capture_props, str);
+		pw_properties_set(props, "sink_properties", NULL);
+	}
+	pw_properties_set(playback_props, PW_KEY_NODE_PASSIVE, "true");
+	if (pw_properties_get(capture_props, PW_KEY_MEDIA_CLASS) == NULL)
+		pw_properties_set(capture_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
+
+	if ((str = pw_properties_get(props, "master")) != NULL) {
+		pw_properties_set(playback_props, PW_KEY_TARGET_OBJECT, str);
+		pw_properties_set(props, "master", NULL);
+	}
+
+	if (module_args_to_audioinfo_keys(module->impl, props,
+				NULL, NULL, "channels", "channel_map", &info) < 0) {
+		res = -EINVAL;
+		goto out;
+	}
+	audioinfo_to_properties(&info, global_props);
+
+	d->module = module;
+	d->global_props = global_props;
+	d->capture_props = capture_props;
+	d->playback_props = playback_props;
+
+	return 0;
+out:
+	pw_properties_free(global_props);
+	pw_properties_free(playback_props);
+	pw_properties_free(capture_props);
+
+	return res;
+}
+
+DEFINE_MODULE_INFO(module_virtual_sink) = {
+	.name = "module-virtual-sink",
+	.valid_args = valid_args,
+	.prepare = module_virtual_sink_prepare,
+	.load = module_virtual_sink_load,
+	.unload = module_virtual_sink_unload,
+	.properties = &SPA_DICT_INIT_ARRAY(module_virtual_sink_info),
+	.data_size = sizeof(struct module_virtual_sink_data),
+};
