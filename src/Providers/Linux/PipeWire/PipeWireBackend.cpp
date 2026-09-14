@@ -173,11 +173,6 @@ public:
             actualConfig_.format.sampleRate = sampleRate;
             actualConfig_.format.channelCount = channelCount;
         }
-        // Grow-only: AddBuffer() may already have sized buffer_ to the real
-        // negotiated buffer capacity during connect/negotiation above. Don't
-        // clobber that with a smaller fixed floor, or Render() will end up
-        // permanently hitting the "frameCount > buffer_.FrameCount()" silence
-        // branch and callback_ will never be invoked.
         const auto minimumFrameCount = std::max<std::size_t>(requestedConfig.framesPerBuffer, 4096);
         if (buffer_.FrameCount() < minimumFrameCount) {
             buffer_ = Audio::AudioBuffer(actualConfig_.format, minimumFrameCount);
