@@ -12,7 +12,6 @@ It supports real-time playback, offline rendering, audio effects, plugins, and m
 
 * Real-time audio playback
 * Offline audio rendering
-* In-memory audio data
 * WAV support
 * Ogg/Vorbis read and write
 * MP3 support
