@@ -1,81 +1,90 @@
-## LuAudio
+# LuAudio — Cross-Platform C++ Audio Engine
 
-## What is it?
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Android-lightgrey)](CMakePresets.json)
+[![C++](https://img.shields.io/badge/C%2B%2B-20-blue)](CMakeLists.txt)
 
-LuAudio is an audio engine written in C++, it's cross-platform and built with performance in mind.
+LuAudio is a cross-platform C++ audio engine built with performance in mind.
 
-## What can it do?
+It supports real-time playback, offline rendering, audio effects, plugins, and multiple platform audio backends.
 
-LuAudio can playback audio files in many formats in real time, render them offline to a file.
-It also has support for chaining effects, plugins, and much more things
+## Features
+
+* Real-time audio playback
+* Offline audio rendering
+* In-memory audio data
+* WAV support
+* Ogg/Vorbis read and write
+* MP3 support
+* Audio effect chaining
+* Plugin support
+* Platform audio backends
+* Cross-platform C++20 API
+
+## Platform Support
+
+| Platform | Status        | Notes    |
+| -------- | ------------- | -------- |
+| Windows  | ✅ Most mature | WASAPI   |
+| Android  | ✅ Tested      | Oboe     |
+| Linux    | 🟡 Supported  | PipeWire |
 
 ## Is it stable?
 
-LuAudio has been put through many stress-tests across all supported platforms to ensure stable usage.
-Though, if you find any issues with it feel free to open an issue :D
+LuAudio has gone through stress testing across its supported platforms, including a lot of testing on Android.
 
-## Where is documentation at?
+It's still a project under development though, so issues can happen. Feel free to open an issue if you find one.
 
-Currently, LuAudio does not have a website for documentation. Though, you can read the header files for it, all the functions
-are neatly documented for anyone who wants to read them.
+## Documentation
+
+LuAudio does not currently have a documentation website.
+
+The public headers are fully documented and are currently the main source of API documentation.
 
 ## Building
 
-LuAudio uses CMake for building.
+LuAudio uses CMake.
 
 ### Windows
 
-You'll need:
-
-* Visual Studio with C++ tools
-* Windows SDK
-* CMake
-* Ninja
-
-Open LuAudio in Visual Studio and select one of the CMake presets from the configuration dropdown.
+You'll need Visual Studio with C++ tools, the Windows SDK, CMake, and Ninja.
 
 Available presets:
 
-* `x64-debug`
-* `x64-release`
-* `x86-debug`
-* `x86-release`
+```
+x64-debug
+x64-release
+x86-debug
+x86-release
+```
 
-Then just build it through Visual Studio.
+Open the project in Visual Studio, select a preset, and build normally.
 
 ### Android
 
-You'll need:
+You'll need the Android NDK 29.0.14206865, CMake, and Ninja.
 
-* Android NDK 29.0.14206865
-* CMake
-* Ninja
+Available presets:
 
-Select one of the Android presets:
-
-* `android-arm64-debug`
-* `android-arm64-release`
-
-Then build it normally.
+```
+android-arm64-debug
+android-arm64-release
+```
 
 ### Hardcoded paths
 
-Some paths in `CMakePresets.json` are hardcoded to my setup, so you'll probably need to change them.
+Some paths in `CMakePresets.json` currently point to my own setup, so you may need to change them for your machine.
 
-Android NDK:
+## History
 
-```
-E:/Android/Sdk/ndk/29.0.14206865/build/cmake/android.toolchain.cmake
-E:/Android/Sdk/ndk/29.0.14206865
-```
+LuAudio started as a small C++ audio project and slowly grew into a proper cross-platform audio engine.
 
-If your NDK is somewhere else, change `CMAKE_TOOLCHAIN_FILE` and `CMAKE_ANDROID_NDK`.
+As I kept working on it, I added more formats, platform backends, effects, plugins, offline rendering, and in-memory audio support.
 
-Windows SDK:
+## Vision
 
-```
-C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe
-C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe
-```
+I want LuAudio to stay relatively lightweight while still being capable enough for real applications that need an audio engine without dragging in a huge framework.
 
-If you have a different Windows SDK version, change `CMAKE_RC_COMPILER` and `CMAKE_MT`.
+## License
+
+LuAudio uses the Apache 2.0 license. See [LICENSE](LICENSE) for details.
